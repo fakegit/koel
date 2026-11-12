@@ -2,28 +2,25 @@
 
 namespace App\Listeners;
 
-use App\Events\SongsBatchLiked;
+use App\Events\MultipleSongsLiked;
 use App\Models\Song;
-use App\Services\LastfmService;
-use App\Values\LastfmLoveTrackParameters;
+use App\Services\Integrations\LastfmService;
 use Illuminate\Contracts\Queue\ShouldQueue;
 
-class LoveMultipleTracksOnLastfm implements ShouldQueue
+readonly class LoveMultipleTracksOnLastfm implements ShouldQueue
 {
-    private LastfmService $lastfm;
+    public function __construct(
+        private LastfmService $lastfm,
+    ) {}
 
-    public function __construct(LastfmService $lastfm)
+    public function handle(MultipleSongsLiked $event): void
     {
-        $this->lastfm = $lastfm;
-    }
+        $songs = $event->songs->filter(static fn (Song $song) => $song->isScrobbleable());
 
-    public function handle(SongsBatchLiked $event): void
-    {
-        $this->lastfm->batchToggleLoveTracks(
-            $event->songs->map(static function (Song $song): LastfmLoveTrackParameters {
-                return LastfmLoveTrackParameters::make($song->title, $song->artist->name);
-            }),
-            $event->user
-        );
+        if ($songs->isEmpty() || !$this->lastfm->isConnected($event->user)) {
+            return;
+        }
+
+        $this->lastfm->batchToggleLoveTracks($songs, $event->user, true);
     }
 }

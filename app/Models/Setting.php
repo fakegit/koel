@@ -2,67 +2,59 @@
 
 namespace App\Models;
 
+use Database\Factories\SettingFactory;
+use Illuminate\Database\Eloquent\Attributes\Table;
+use Illuminate\Database\Eloquent\Attributes\Unguarded;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use OwenIt\Auditing\Auditable;
+use OwenIt\Auditing\Contracts\Auditable as AuditableContract;
 
 /**
+ * @property int $id
+ * @property ?string $organization_id
  * @property string $key
  * @property mixed $value
  *
- * @method static self find(string $key)
- * @method static self updateOrCreate(array $where, array $params)
+ * @method static SettingFactory factory(...$parameters)
  */
-class Setting extends Model
+#[Table(timestamps: false)]
+#[Unguarded]
+class Setting extends Model implements AuditableContract
 {
+    use Auditable;
     use HasFactory;
 
-    protected $primaryKey = 'key';
-    public $timestamps = false;
-    protected $guarded = [];
+    protected function casts(): array
+    {
+        return ['value' => 'json'];
+    }
 
     /**
-     * Get a setting value.
+     * @param ?Organization $organization the organization the setting belongs to, or null for an install-wide one
      */
-    public static function get(string $key) // @phpcs:ignore
+    public static function get(string $key, ?Organization $organization = null): mixed
     {
-        $record = self::find($key);
-
-        return $record ? $record->value : null;
+        return self::query()->where('key', $key)->where('organization_id', $organization?->id)->first()?->value;
     }
 
     /**
      * Set a setting (no pun) value.
      *
-     * @param string|array $key the key of the setting, or an associative array of settings,
+     * @param array|string $key the key of the setting, or an associative array of settings,
      *                            in which case $value will be discarded
+     * @param ?Organization $organization the organization the setting belongs to, or null for an install-wide one
      */
-    public static function set($key, $value = null): void
+    public static function set(array|string $key, $value = '', ?Organization $organization = null): void
     {
         if (is_array($key)) {
             foreach ($key as $k => $v) {
-                self::set($k, $v);
+                self::set($k, $v, $organization);
             }
 
             return;
         }
 
-        self::updateOrCreate(compact('key'), compact('value'));
-    }
-
-    /**
-     * Serialize the setting value before saving into the database.
-     * This makes settings more flexible.
-     */
-    public function setValueAttribute($value): void
-    {
-        $this->attributes['value'] = serialize($value);
-    }
-
-    /**
-     * Get the unserialized setting value.
-     */
-    public function getValueAttribute($value) // @phpcs:ignore
-    {
-        return unserialize($value);
+        self::query()->updateOrCreate(['key' => $key, 'organization_id' => $organization?->id], compact('value'));
     }
 }

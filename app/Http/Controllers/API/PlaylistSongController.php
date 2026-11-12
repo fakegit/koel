@@ -2,38 +2,70 @@
 
 namespace App\Http\Controllers\API;
 
-use App\Http\Requests\API\PlaylistSongUpdateRequest;
+use App\Facades\License;
+use App\Http\Controllers\Controller;
+use App\Http\Requests\API\AddSongsToPlaylistRequest;
+use App\Http\Requests\API\Playlist\RemoveSongsFromPlaylistRequest;
+use App\Http\Resources\CollaborativeSongResource;
+use App\Http\Resources\SongResource;
 use App\Models\Playlist;
-use App\Services\SmartPlaylistService;
+use App\Models\User;
+use App\Repositories\SongRepository;
+use App\Services\Playlist\PlaylistService;
+use Illuminate\Contracts\Auth\Authenticatable;
+use Illuminate\Http\Resources\Json\ResourceCollection;
+use Illuminate\Http\Response;
+use Illuminate\Support\Collection;
 
 class PlaylistSongController extends Controller
 {
-    private SmartPlaylistService $smartPlaylistService;
-
-    public function __construct(SmartPlaylistService $smartPlaylistService)
-    {
-        $this->smartPlaylistService = $smartPlaylistService;
-    }
+    /** @param User $user */
+    public function __construct(
+        private readonly SongRepository $songRepository,
+        private readonly PlaylistService $playlistService,
+        private readonly Authenticatable $user,
+    ) {}
 
     public function index(Playlist $playlist)
     {
-        $this->authorize('owner', $playlist);
+        if ($playlist->is_smart) {
+            $this->authorize('own', $playlist);
 
-        return response()->json(
-            $playlist->is_smart
-                ? $this->smartPlaylistService->getSongs($playlist)->pluck('id')
-                : $playlist->songs->pluck('id')
-        );
+            return SongResource::collection($this->songRepository->getByPlaylist($playlist, $this->user));
+        }
+
+        $this->authorize('collaborate', $playlist);
+
+        return self::createResourceCollection($this->songRepository->getByPlaylist($playlist, $this->user));
     }
 
-    public function update(PlaylistSongUpdateRequest $request, Playlist $playlist)
+    public function store(Playlist $playlist, AddSongsToPlaylistRequest $request)
     {
-        $this->authorize('owner', $playlist);
+        abort_if($playlist->is_smart, Response::HTTP_FORBIDDEN, 'Smart playlist content is automatically generated');
 
-        abort_if($playlist->is_smart, 403, 'A smart playlist\'s content cannot be updated manually.');
+        $this->authorize('collaborate', $playlist);
 
-        $playlist->songs()->sync((array) $request->songs);
+        $playables = $this->songRepository->getMany(ids: $request->songs, scopedUser: $this->user);
 
-        return response()->json();
+        return self::createResourceCollection($this->playlistService->addPlayablesToPlaylist(
+            $playlist,
+            $playables,
+            $this->user,
+        ));
+    }
+
+    private static function createResourceCollection(Collection $songs): ResourceCollection
+    {
+        return License::isPlus() ? CollaborativeSongResource::collection($songs) : SongResource::collection($songs);
+    }
+
+    public function destroy(Playlist $playlist, RemoveSongsFromPlaylistRequest $request)
+    {
+        abort_if($playlist->is_smart, Response::HTTP_FORBIDDEN, 'Smart playlist content is automatically generated');
+
+        $this->authorize('collaborate', $playlist);
+        $this->playlistService->removePlayablesFromPlaylist($playlist, $request->songs);
+
+        return response()->noContent();
     }
 }

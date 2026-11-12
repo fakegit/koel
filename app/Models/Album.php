@@ -2,68 +2,108 @@
 
 namespace App\Models;
 
-use App\Traits\SupportsDeleteWhereIDsNotIn;
-use Illuminate\Database\Eloquent\Builder;
+use App\Builders\AlbumBuilder;
+use App\Models\Concerns\Albums\HasAlbumAttributes;
+use App\Models\Concerns\HasMbid;
+use App\Models\Concerns\MorphsToFavorites;
+use App\Models\Concerns\MorphsToRatings;
+use App\Models\Concerns\SupportsDeleteWhereValueNotIn;
+use App\Models\Contracts\Favoriteable;
+use App\Models\Contracts\Rateable;
+use App\Observers\AlbumObserver;
+use Carbon\Carbon;
+use Database\Factories\AlbumFactory;
+use Illuminate\Database\Eloquent\Attributes\Appends;
+use Illuminate\Database\Eloquent\Attributes\Guarded;
+use Illuminate\Database\Eloquent\Attributes\Hidden;
+use Illuminate\Database\Eloquent\Attributes\ObservedBy;
+use Illuminate\Database\Eloquent\Attributes\UseEloquentBuilder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Concerns\HasUlids;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Laravel\Scout\Searchable;
+use OwenIt\Auditing\Auditable;
+use OwenIt\Auditing\Contracts\Auditable as AuditableContract;
 
 /**
- * @property string $cover The album cover's file name
- * @property string|null $cover_path The absolute path to the cover file
- * @property bool $has_cover If the album has a non-default cover image
- * @property int $id
- * @property string $name Name of the album
- * @property bool $is_compilation If the album is a compilation from multiple artists
+ * @property ?boolean $favorite Whether the album is liked by the scoped user
+ * @property ?Carbon $favorited_at When the scoped user favorited the album, if at all
+ * @property ?Carbon $last_played_at When the scoped user last played the album, if at all
+ * @property ?int $year
+ * @property ?string $description Description written by the user, as sanitized HTML
+ * @property ?string $thumbnail The album's thumbnail file name
  * @property Artist $artist The album's artist
- * @property int $artist_id
- * @property Collection $songs
+ * @property Carbon $created_at
+ * @property Collection<array-key, Song> $songs
+ * @property User $user
  * @property bool $is_unknown If the album is the Unknown Album
- * @property string|null $thumbnail_name The file name of the album's thumbnail
- * @property string|null $thumbnail_path The full path to the thumbnail.
- *                                       Notice that this doesn't guarantee the thumbnail exists.
- * @property string|null $thumbnail The public URL to the album's thumbnail
+ * @property bool $is_standard If the album is not the Unknown Album
+ * @property bool $is_identifiable If both the album and its artist are known, so online sources can look it up
+ * @property int $user_id
+ * @property string $artist_id
+ * @property string $artist_name
+ * @property string $cover The album cover's file name
+ * @property ?string $small_cover The file name of a sharp, downsized copy of the cover, for small renders
+ * @property string $id
+ * @property ?string $mbid The MusicBrainz release ID
+ * @property string $name Name of the album
  *
- * @method static self firstOrCreate(array $where, array $params = [])
- * @method static self|null find(int $id)
- * @method static Builder where(...$params)
- * @method static self first()
- * @method static Builder whereArtistIdAndName(int $id, string $name)
- * @method static orderBy(...$params)
+ * @method static AlbumFactory factory(...$parameters)
  */
-class Album extends Model
+#[ObservedBy(AlbumObserver::class)]
+#[UseEloquentBuilder(AlbumBuilder::class)]
+#[Guarded(['id'])]
+#[Hidden(['updated_at'])]
+#[Appends(['is_compilation'])]
+class Album extends Model implements AuditableContract, Favoriteable, Rateable
 {
+    use Auditable;
+    use HasAlbumAttributes;
+    use HasMbid;
     use HasFactory;
+    use HasUlids;
+    use MorphsToFavorites;
+    use MorphsToRatings;
     use Searchable;
-    use SupportsDeleteWhereIDsNotIn;
+    use SupportsDeleteWhereValueNotIn;
 
-    public const UNKNOWN_ID = 1;
-    public const UNKNOWN_NAME = 'Unknown Album';
-    public const UNKNOWN_COVER = 'unknown-album.png';
+    public const string UNKNOWN_NAME = 'Unknown Album';
 
-    protected $guarded = ['id'];
-    protected $hidden = ['updated_at'];
-    protected $casts = ['artist_id' => 'integer'];
-    protected $appends = ['is_compilation'];
+    protected $with = ['artist'];
+
+    /** @deprecated */
+    /** @inheritDoc */
+    protected function casts(): array
+    {
+        return [
+            'favorite' => 'boolean',
+            'favorited_at' => 'datetime',
+            'last_played_at' => 'datetime',
+        ];
+    }
+
+    public static function query(): AlbumBuilder
+    {
+        /** @var AlbumBuilder */
+        return parent::query()->addSelect('albums.*');
+    }
 
     /**
      * Get an album using some provided information.
      * If such is not found, a new album will be created using the information.
      */
-    public static function getOrCreate(Artist $artist, ?string $name = null, bool $isCompilation = false): self
+    public static function getOrCreate(Artist $artist, ?string $name = null): static
     {
-        // If this is a compilation album, its artist must be "Various Artists"
-        if ($isCompilation) {
-            $artist = Artist::getVariousArtist();
-        }
-
-        return static::firstOrCreate([
-            'artist_id' => $artist->id,
-            'name' => trim($name) ?: self::UNKNOWN_NAME,
-        ]);
+        return static::query() // @phpstan-ignore-line
+            ->firstOrCreate([
+                'artist_id' => $artist->id,
+                'artist_name' => $artist->name,
+                'user_id' => $artist->user_id,
+                'name' => trim($name) ?: self::UNKNOWN_NAME,
+            ]);
     }
 
     public function artist(): BelongsTo
@@ -76,90 +116,47 @@ class Album extends Model
         return $this->hasMany(Song::class);
     }
 
-    public function getIsUnknownAttribute(): bool
+    public function user(): BelongsTo
     {
-        return $this->id === self::UNKNOWN_ID;
+        return $this->belongsTo(User::class);
     }
 
-    public function setCoverAttribute(?string $value): void
+    public function belongsToUser(User $user): bool
     {
-        $this->attributes['cover'] = $value ?: self::UNKNOWN_COVER;
+        return $this->user_id === $user->id;
     }
 
-    public function getCoverAttribute(?string $value): string
-    {
-        return album_cover_url($value ?: self::UNKNOWN_COVER);
-    }
-
-    public function getHasCoverAttribute(): bool
-    {
-        $cover = array_get($this->attributes, 'cover');
-
-        if (!$cover) {
-            return false;
-        }
-
-        if ($cover === self::UNKNOWN_COVER) {
-            return false;
-        }
-
-        return file_exists(album_cover_path($cover));
-    }
-
-    public function getCoverPathAttribute(): ?string
-    {
-        $cover = array_get($this->attributes, 'cover');
-
-        return $cover ? album_cover_path($cover) : null;
-    }
-
-    /**
-     * Sometimes the tags extracted from getID3 are HTML entity encoded.
-     * This makes sure they are always sane.
-     */
-    public function getNameAttribute(string $value): string
-    {
-        return html_entity_decode($value);
-    }
-
-    public function getIsCompilationAttribute(): bool
-    {
-        return $this->artist_id === Artist::VARIOUS_ID;
-    }
-
-    public function getThumbnailNameAttribute(): ?string
-    {
-        if (!$this->has_cover) {
-            return null;
-        }
-
-        $parts = pathinfo($this->cover_path);
-
-        return sprintf('%s_thumb.%s', $parts['filename'], $parts['extension']);
-    }
-
-    public function getThumbnailPathAttribute(): ?string
-    {
-        return $this->thumbnail_name ? album_cover_path($this->thumbnail_name) : null;
-    }
-
-    public function getThumbnailAttribute(): ?string
-    {
-        return $this->thumbnail_name ? album_cover_url($this->thumbnail_name) : null;
-    }
-
-    /** @return array<mixed> */
+    /** @inheritdoc */
     public function toSearchableArray(): array
     {
         $array = [
             'id' => $this->id,
+            'user_id' => $this->user_id,
             'name' => $this->name,
         ];
 
-        if (!$this->artist->is_unknown && !$this->artist->is_various) {
-            $array['artist'] = $this->artist->name;
+        if (
+            $this->artist_name
+            && $this->artist_name !== Artist::UNKNOWN_NAME
+            && $this->artist_name !== Artist::VARIOUS_NAME
+        ) {
+            $array['artist'] = $this->artist_name;
         }
 
         return $array;
+    }
+
+    public function setYearIfMissing(?int $year): void
+    {
+        if (!$year || $this->year) {
+            return;
+        }
+
+        $stored = static::query()->whereKey($this->getKey())->whereNull('year')->update(['year' => $year]) > 0;
+
+        if ($stored) {
+            $this->year = $year;
+            $this->syncOriginalAttribute('year');
+        }
     }
 }

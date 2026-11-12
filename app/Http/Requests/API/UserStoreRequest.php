@@ -2,29 +2,39 @@
 
 namespace App\Http\Requests\API;
 
+use App\Enums\Acl\Role;
+use App\Http\Requests\API\Concerns\ValidatesRole;
+use App\Values\User\UserCreateData;
+use Illuminate\Validation\Rule;
 use Illuminate\Validation\Rules\Password;
 
 /**
- * @property string $password
- * @property string $name
- * @property string $email
- * @property bool   $is_admin
+ * @property-read string $password
+ * @property-read string $name
+ * @property-read string $email
  */
 class UserStoreRequest extends Request
 {
-    public function authorize(): bool
-    {
-        return auth()->user()->is_admin;
-    }
+    use ValidatesRole;
 
-    /** @return array<mixed> */
+    /** @inheritdoc */
     public function rules(): array
     {
         return [
-            'name' => 'required',
-            'email' => 'required|email|unique:users',
-            'password' => ['required', Password::defaults()],
-            'is_admin' => 'required',
+            'name' => [Rule::required()],
+            'email' => [Rule::required(), Rule::email(), Rule::unique('users')],
+            'password' => [Rule::required(), Password::defaults()],
+            'role' => $this->roleRule(),
         ];
+    }
+
+    public function toDto(): UserCreateData
+    {
+        return UserCreateData::make(
+            name: $this->name,
+            email: $this->email,
+            plainTextPassword: $this->password,
+            role: $this->enum('role', Role::class),
+        );
     }
 }

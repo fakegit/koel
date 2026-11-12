@@ -1,0 +1,33 @@
+<template>
+  <ShelfSection>
+    <template #header>Recently Played</template>
+    <template #actions>
+      <ViewAllRecentlyPlayedPlayablesButton v-if="playables.length" />
+    </template>
+    <PlayableCardGridSkeleton v-if="loading" class="-mx-6" role="status" aria-busy="true" aria-label="Loading" />
+    <template v-else>
+      <PlayableCardGrid v-if="playables.length" class="-mx-6" :playables />
+      <p v-else>Nothing played as of late.</p>
+    </template>
+  </ShelfSection>
+</template>
+
+<script lang="ts" setup>
+import { computed, toRefs } from 'vue'
+import { recentlyPlayedStore } from '@/stores/recentlyPlayedStore'
+import { isSong } from '@/utils/typeGuards'
+
+import ShelfSection from '@/components/ui/ShelfSection.vue'
+import ViewAllRecentlyPlayedPlayablesButton from '@/components/screens/home/ViewAllRecentlyPlayedPlayablesButton.vue'
+import PlayableCardGrid from '@/components/screens/home/PlayableCardGrid.vue'
+import PlayableCardGridSkeleton from '@/components/screens/home/PlayableCardGridSkeleton.vue'
+
+const props = withDefaults(defineProps<{ loading?: boolean }>(), { loading: false })
+const { loading } = toRefs(props)
+
+const playables = computed(() =>
+  recentlyPlayedStore.excerptState.playables.filter(
+    playable => !(isSong(playable) && playable.deleted) && playable.play_count > 0,
+  ),
+)
+</script>

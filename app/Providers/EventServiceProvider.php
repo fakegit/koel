@@ -2,70 +2,62 @@
 
 namespace App\Providers;
 
-use App\Events\AlbumInformationFetched;
-use App\Events\ArtistInformationFetched;
 use App\Events\LibraryChanged;
-use App\Events\MediaCacheObsolete;
-use App\Events\SongLikeToggled;
-use App\Events\SongsBatchLiked;
-use App\Events\SongsBatchUnliked;
-use App\Events\SongStartedPlaying;
-use App\Listeners\ClearMediaCache;
-use App\Listeners\DownloadAlbumCover;
-use App\Listeners\DownloadArtistImage;
+use App\Events\MediaScanCompleted;
+use App\Events\MultipleSongsLiked;
+use App\Events\MultipleSongsUnliked;
+use App\Events\NewPlaylistCollaboratorJoined;
+use App\Events\PlaybackStarted;
+use App\Events\SongFavoriteToggled;
+use App\Events\UserUnsubscribedFromPodcast;
+use App\Listeners\DeleteNonExistingRecordsPostScan;
+use App\Listeners\DeletePodcastIfNoSubscribers;
+use App\Listeners\InvalidateLibrarySummaries;
 use App\Listeners\LoveMultipleTracksOnLastfm;
 use App\Listeners\LoveTrackOnLastfm;
-use App\Listeners\TidyLibrary;
+use App\Listeners\MakePlaylistSongsPublic;
+use App\Listeners\PruneLibrary;
 use App\Listeners\UnloveMultipleTracksOnLastfm;
-use App\Listeners\UpdateLastfmNowPlaying;
-use App\Models\Album;
-use App\Models\Song;
-use App\Observers\AlbumObserver;
-use App\Observers\SongObserver;
-use Illuminate\Foundation\Support\Providers\EventServiceProvider as ServiceProvider;
+use App\Listeners\UpdateNowPlaying;
+use App\Listeners\WriteScanLog;
+use Illuminate\Foundation\Support\Providers\EventServiceProvider as BaseServiceProvider;
 
-class EventServiceProvider extends ServiceProvider
+class EventServiceProvider extends BaseServiceProvider
 {
     protected $listen = [
-        SongLikeToggled::class => [
+        SongFavoriteToggled::class => [
             LoveTrackOnLastfm::class,
         ],
 
-        SongsBatchLiked::class => [
+        MultipleSongsLiked::class => [
             LoveMultipleTracksOnLastfm::class,
         ],
 
-        SongsBatchUnliked::class => [
+        MultipleSongsUnliked::class => [
             UnloveMultipleTracksOnLastfm::class,
         ],
 
-        SongStartedPlaying::class => [
-            UpdateLastfmNowPlaying::class,
+        PlaybackStarted::class => [
+            UpdateNowPlaying::class,
         ],
 
         LibraryChanged::class => [
-            TidyLibrary::class,
-            ClearMediaCache::class,
+            PruneLibrary::class,
+            InvalidateLibrarySummaries::class,
         ],
 
-        MediaCacheObsolete::class => [
-            ClearMediaCache::class,
+        MediaScanCompleted::class => [
+            DeleteNonExistingRecordsPostScan::class,
+            WriteScanLog::class,
+            InvalidateLibrarySummaries::class,
         ],
 
-        AlbumInformationFetched::class => [
-            DownloadAlbumCover::class,
+        NewPlaylistCollaboratorJoined::class => [
+            MakePlaylistSongsPublic::class,
         ],
 
-        ArtistInformationFetched::class => [
-            DownloadArtistImage::class,
+        UserUnsubscribedFromPodcast::class => [
+            DeletePodcastIfNoSubscribers::class,
         ],
     ];
-
-    public function boot(): void
-    {
-        parent::boot();
-
-        Song::observe(SongObserver::class);
-        Album::observe(AlbumObserver::class);
-    }
 }

@@ -2,11 +2,14 @@
 
 namespace App\Repositories;
 
-class SettingRepository extends AbstractRepository
+use App\Models\Setting;
+
+/** @extends Repository<Setting> */
+class SettingRepository extends Repository
 {
     /** @return array<mixed> */
-    public function getAllAsKeyValueArray(): array
+    public function getInstallWideAsKeyValueArray(): array
     {
-        return $this->model->pluck('value', 'key')->all();
+        return $this->modelClass::query()->whereNull('organization_id')->pluck('value', 'key')->toArray();
     }
 }

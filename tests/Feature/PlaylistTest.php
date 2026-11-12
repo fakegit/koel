@@ -2,160 +2,472 @@
 
 namespace Tests\Feature;
 
+use App\Helpers\Ulid;
+use App\Http\Resources\PlaylistResource;
+use App\Models\Embed;
 use App\Models\Playlist;
 use App\Models\Song;
-use App\Models\User;
-use App\Values\SmartPlaylistRule;
-use Illuminate\Support\Collection;
+use App\Services\Playlist\PlaylistFolderService;
+use App\Values\EmbedOptions;
+use App\Values\SmartPlaylist\SmartPlaylistRule;
+use PHPUnit\Framework\Attributes\Test;
+use Tests\TestCase;
+
+use function Tests\create_playlist;
+use function Tests\create_playlists;
+use function Tests\create_user;
+use function Tests\minimal_base64_encoded_image;
+use function Tests\stored_image_name;
 
 class PlaylistTest extends TestCase
 {
-    public function setUp(): void
+    #[Test]
+    public function listing(): void
     {
-        parent::setUp();
+        $user = create_user();
+        create_playlists(count: 3, owner: $user);
 
-        static::createSampleMediaSet();
+        $this
+            ->getAs('api/playlists', $user)
+            ->assertJsonStructure([0 => PlaylistResource::JSON_STRUCTURE])
+            ->assertJsonCount(3, '*');
     }
 
-    public function testCreatingPlaylist(): void
+    #[Test]
+    public function creatingPlaylist(): void
     {
-        /** @var User $user */
-        $user = User::factory()->create();
+        /** @var PlaylistFolderService $playlistFolderService */
+        $playlistFolderService = app(PlaylistFolderService::class);
 
-        /** @var array<Song>|Collection $songs */
-        $songs = Song::orderBy('id')->take(3)->get();
+        $user = create_user();
 
-        $response = $this->postAsUser('api/playlist', [
-            'name' => 'Foo Bar',
-            'songs' => $songs->pluck('id')->toArray(),
-            'rules' => [],
-        ], $user);
+        $songs = Song::factory()->createMany(2);
 
-        $response->assertOk();
+        $ulid = Ulid::freeze();
 
-        /** @var Playlist $playlist */
-        $playlist = Playlist::orderBy('id', 'desc')->first();
+        $this->postAs(
+            'api/playlists',
+            [
+                'name' => 'Foo Bar',
+                'description' => 'Foo Bar Description',
+                'songs' => $songs->modelKeys(),
+                'rules' => [],
+                'cover' => minimal_base64_encoded_image(),
+            ],
+            $user,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        $playlist = Playlist::query()->latest()->firstOrFail();
 
         self::assertSame('Foo Bar', $playlist->name);
-        self::assertTrue($playlist->user->is($user));
-        self::assertEqualsCanonicalizing($songs->pluck('id')->all(), $playlist->songs->pluck('id')->all());
+        self::assertSame('Foo Bar Description', $playlist->description);
+        self::assertTrue($playlist->ownedBy($user));
+        self::assertNull($playlistFolderService->getFolderForPlaylist($playlist));
+        self::assertEqualsCanonicalizing($songs->modelKeys(), $playlist->playables->modelKeys());
+        self::assertSame(stored_image_name($ulid), $playlist->cover);
     }
 
-    public function testCreatingSmartPlaylist(): void
+    #[Test]
+    public function creatingPlaylistWithNewFolderName(): void
     {
-        /** @var User $user */
-        $user = User::factory()->create();
+        $user = create_user();
 
-        $rule = SmartPlaylistRule::create([
+        $this->postAs(
+            'api/playlists',
+            [
+                'name' => 'My Playlist',
+                'description' => '',
+                'songs' => [],
+                'rules' => [],
+                'folder_name' => 'Brand New Folder',
+            ],
+            $user,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        $playlist = Playlist::query()->latest()->firstOrFail();
+
+        self::assertSame('My Playlist', $playlist->name);
+
+        $folder = app(PlaylistFolderService::class)->getFolderForPlaylist($playlist);
+        self::assertNotNull($folder);
+        self::assertSame('Brand New Folder', $folder->name);
+        self::assertTrue($folder->user->is($user));
+    }
+
+    #[Test]
+    public function updatingPlaylistWithNewFolderName(): void
+    {
+        $playlist = create_playlist();
+
+        $this->putAs(
+            "api/playlists/{$playlist->id}",
+            [
+                'name' => 'Updated',
+                'description' => '',
+                'folder_name' => 'New Folder',
+            ],
+            $playlist->owner,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        $folder = app(PlaylistFolderService::class)->getFolderForPlaylist($playlist->refresh());
+        self::assertNotNull($folder);
+        self::assertSame('New Folder', $folder->name);
+    }
+
+    #[Test]
+    public function creatingPlaylistWithBothFolderIdAndFolderNameFails(): void
+    {
+        $user = create_user();
+        $folder = $user->playlistFolders()->create(['name' => 'Existing']);
+
+        $this->postAs(
+            'api/playlists',
+            [
+                'name' => 'My Playlist',
+                'description' => '',
+                'songs' => [],
+                'rules' => [],
+                'folder_id' => $folder->id,
+                'folder_name' => 'New Folder',
+            ],
+            $user,
+        )->assertUnprocessable();
+    }
+
+    #[Test]
+    public function updatingPlaylistWithBothFolderIdAndFolderNameFails(): void
+    {
+        $playlist = create_playlist();
+        $folder = $playlist->owner->playlistFolders()->create(['name' => 'Existing']);
+
+        $this->putAs(
+            "api/playlists/{$playlist->id}",
+            [
+                'name' => 'Updated',
+                'description' => '',
+                'folder_id' => $folder->id,
+                'folder_name' => 'New Folder',
+            ],
+            $playlist->owner,
+        )->assertUnprocessable();
+    }
+
+    #[Test]
+    public function updatingPlaylistMovesItBetweenFolders(): void
+    {
+        $playlist = create_playlist();
+        $folderA = $playlist->owner->playlistFolders()->create(['name' => 'A']);
+        $folderB = $playlist->owner->playlistFolders()->create(['name' => 'B']);
+        $playlist->folders()->attach($folderA->id);
+
+        $this->putAs(
+            "api/playlists/{$playlist->id}",
+            [
+                'name' => $playlist->name,
+                'description' => '',
+                'folder_id' => $folderB->id,
+            ],
+            $playlist->owner,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        $folder = app(PlaylistFolderService::class)->getFolderForPlaylist($playlist->refresh());
+        self::assertNotNull($folder);
+        self::assertSame($folderB->id, $folder->id);
+        self::assertCount(1, $playlist->folders()->where('user_id', $playlist->owner->id)->get());
+    }
+
+    #[Test]
+    public function updatingPlaylistWithNullFolderIdRemovesFromFolder(): void
+    {
+        $playlist = create_playlist();
+        $folder = $playlist->owner->playlistFolders()->create(['name' => 'A']);
+        $playlist->folders()->attach($folder->id);
+
+        $this->putAs(
+            "api/playlists/{$playlist->id}",
+            [
+                'name' => $playlist->name,
+                'description' => '',
+                'folder_id' => null,
+            ],
+            $playlist->owner,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        self::assertNull(app(PlaylistFolderService::class)->getFolderForPlaylist($playlist->refresh()));
+    }
+
+    #[Test]
+    public function createPlaylistWithoutCover(): void
+    {
+        /** @var PlaylistFolderService $playlistFolderService */
+        $playlistFolderService = app(PlaylistFolderService::class);
+
+        $user = create_user();
+
+        $this->postAs(
+            'api/playlists',
+            [
+                'name' => 'Foo Bar',
+                'description' => 'Foo Bar Description',
+                'songs' => [],
+                'rules' => [],
+            ],
+            $user,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        $playlist = Playlist::query()->latest()->firstOrFail();
+
+        self::assertSame('Foo Bar', $playlist->name);
+        self::assertSame('Foo Bar Description', $playlist->description);
+        self::assertTrue($playlist->ownedBy($user));
+        self::assertNull($playlistFolderService->getFolderForPlaylist($playlist));
+        self::assertEmpty($playlist->cover);
+    }
+
+    #[Test]
+    public function createPlaylistWithoutDescription(): void
+    {
+        $user = create_user();
+
+        $this->postAs(
+            'api/playlists',
+            [
+                'name' => 'Foo Bar',
+                'description' => '',
+                'songs' => [],
+                'rules' => [],
+            ],
+            $user,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        $playlist = Playlist::query()->latest()->first();
+
+        self::assertSame('Foo Bar', $playlist->name);
+        self::assertSame('', $playlist->description);
+    }
+
+    #[Test]
+    public function creatingSmartPlaylist(): void
+    {
+        /** @var PlaylistFolderService $playlistFolderService */
+        $playlistFolderService = app(PlaylistFolderService::class);
+
+        $user = create_user();
+
+        $rule = SmartPlaylistRule::make([
             'model' => 'artist.name',
-            'operator' => SmartPlaylistRule::OPERATOR_IS,
+            'operator' => 'is',
             'value' => ['Bob Dylan'],
         ]);
 
-        $this->postAsUser('api/playlist', [
-            'name' => 'Smart Foo Bar',
-            'rules' => [
-                [
-                    'id' => 12345,
-                    'rules' => [$rule->toArray()],
+        $this->postAs(
+            'api/playlists',
+            [
+                'name' => 'Smart Foo Bar',
+                'description' => 'Smart Foo Bar Description',
+                'rules' => [
+                    [
+                        'id' => '2a4548cd-c67f-44d4-8fec-34ff75c8a026',
+                        'rules' => [$rule->toArray()],
+                    ],
                 ],
+                'cover' => minimal_base64_encoded_image(),
             ],
-        ], $user);
+            $user,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
 
-        /** @var Playlist $playlist */
-        $playlist = Playlist::orderBy('id', 'desc')->first();
+        $playlist = Playlist::query()->latest()->first();
 
         self::assertSame('Smart Foo Bar', $playlist->name);
-        self::assertTrue($playlist->user->is($user));
+        self::assertSame('Smart Foo Bar Description', $playlist->description);
+        self::assertTrue($playlist->ownedBy($user));
         self::assertTrue($playlist->is_smart);
         self::assertCount(1, $playlist->rule_groups);
+        self::assertNull($playlistFolderService->getFolderForPlaylist($playlist));
         self::assertTrue($rule->equals($playlist->rule_groups[0]->rules[0]));
+        self::assertNotNull($playlist->cover);
     }
 
-    public function testCreatingSmartPlaylistIgnoresSongs(): void
+    #[Test]
+    public function creatingSmartPlaylistFailsIfSongsProvided(): void
     {
-        $this->postAsUser('api/playlist', [
+        $this->postAs('api/playlists', [
             'name' => 'Smart Foo Bar',
+            'description' => 'Smart Foo Bar Description',
             'rules' => [
                 [
-                    'id' => 12345,
+                    'id' => '2a4548cd-c67f-44d4-8fec-34ff75c8a026',
                     'rules' => [
-                        SmartPlaylistRule::create([
+                        SmartPlaylistRule::make([
                             'model' => 'artist.name',
-                            'operator' => SmartPlaylistRule::OPERATOR_IS,
+                            'operator' => 'is',
                             'value' => ['Bob Dylan'],
                         ])->toArray(),
                     ],
                 ],
             ],
-            'songs' => Song::orderBy('id')->take(3)->get()->pluck('id')->all(),
-        ]);
-
-        /** @var Playlist $playlist */
-        $playlist = Playlist::orderBy('id', 'desc')->first();
-
-        self::assertSame('Smart Foo Bar', $playlist->name);
-        self::assertEmpty($playlist->songs);
+            'songs' => Song::factory()->createMany(2)->modelKeys(),
+        ])->assertUnprocessable();
     }
 
-    public function testCreatingPlaylistWithNonExistentSongsFails(): void
+    #[Test]
+    public function creatingPlaylistWithNonExistentSongsFails(): void
     {
-        $response = $this->postAsUser('api/playlist', [
+        $this->postAs('api/playlists', [
             'name' => 'Foo Bar',
+            'description' => 'Foo Bar Description',
             'rules' => [],
             'songs' => ['foo'],
-        ]);
-
-        $response->assertUnprocessable();
+        ])->assertUnprocessable();
     }
 
-    public function testUpdatePlaylistName(): void
+    #[Test]
+    public function updateKeepingCoverIntact(): void
     {
-        /** @var User $user */
-        $user = User::factory()->create();
-
-        /** @var Playlist $playlist */
-        $playlist = Playlist::factory()->create([
-            'user_id' => $user->id,
-            'name' => 'Foo',
+        $playlist = create_playlist([
+            'cover' => 'neat-cover.webp',
         ]);
 
-        $this->putAsUser("api/playlist/$playlist->id", ['name' => 'Bar'], $user);
+        $this->putAs(
+            "api/playlists/{$playlist->id}",
+            [
+                'name' => 'Bar',
+                'description' => 'Bar Description',
+            ],
+            $playlist->owner,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
 
         self::assertSame('Bar', $playlist->refresh()->name);
+        self::assertSame('Bar Description', $playlist->description);
+        self::assertSame('neat-cover.webp', $playlist->cover);
     }
 
-    public function testNonOwnerCannotUpdatePlaylist(): void
+    #[Test]
+    public function updateReplacingCover(): void
     {
-        /** @var Playlist $playlist */
-        $playlist = Playlist::factory()->create([
-            'name' => 'Foo',
+        $playlist = create_playlist([
+            'cover' => 'neat-cover.webp',
         ]);
 
-        $response = $this->putAsUser("api/playlist/$playlist->id", ['name' => 'Qux']);
-        $response->assertStatus(403);
+        $ulid = Ulid::freeze();
+
+        $this
+            ->putAs(
+                "api/playlists/{$playlist->id}",
+                [
+                    'name' => 'Bar',
+                    'description' => 'Bar Description',
+                    'cover' => minimal_base64_encoded_image(),
+                ],
+                $playlist->owner,
+            )
+            ->assertSuccessful()
+            ->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        self::assertSame(stored_image_name($ulid), $playlist->refresh()->cover);
     }
 
-    public function testDeletePlaylist(): void
+    #[Test]
+    public function updateRemovingCover(): void
     {
-        /** @var User $user */
-        $user = User::factory()->create();
-
-        /** @var Playlist $playlist */
-        $playlist = Playlist::factory()->create([
-            'user_id' => $user->id,
+        $playlist = create_playlist([
+            'cover' => 'neat-cover.webp',
         ]);
 
-        $this->deleteAsUser("api/playlist/$playlist->id", [], $user);
-        self::assertDatabaseMissing('playlists', ['id' => $playlist->id]);
+        $this
+            ->putAs(
+                "api/playlists/{$playlist->id}",
+                [
+                    'name' => 'Bar',
+                    'description' => 'Bar Description',
+                    'cover' => '',
+                ],
+                $playlist->owner,
+            )
+            ->assertSuccessful()
+            ->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        self::assertEmpty($playlist->refresh()->cover);
     }
 
-    public function testNonOwnerCannotDeletePlaylist(): void
+    #[Test]
+    public function updateWithoutDescription(): void
     {
-        /** @var Playlist $playlist */
-        $playlist = Playlist::factory()->create();
+        $playlist = create_playlist(['name' => 'Foo', 'description' => 'Bar Description']);
 
-        $this->deleteAsUser("api/playlist/$playlist->id")
-            ->assertStatus(403);
+        $this->putAs(
+            "api/playlists/{$playlist->id}",
+            [
+                'name' => 'Bar',
+                'description' => '',
+            ],
+            $playlist->owner,
+        )->assertJsonStructure(PlaylistResource::JSON_STRUCTURE);
+
+        self::assertSame('Bar', $playlist->refresh()->name);
+        self::assertSame('', $playlist->description);
+    }
+
+    #[Test]
+    public function nonOwnerCannotUpdatePlaylist(): void
+    {
+        $playlist = create_playlist(['name' => 'Foo']);
+
+        $this->putAs("api/playlists/{$playlist->id}", [
+            'name' => 'Qux',
+            'description' => 'Qux Description',
+        ])->assertForbidden();
+
+        self::assertSame('Foo', $playlist->refresh()->name);
+    }
+
+    #[Test]
+    public function deletePlaylist(): void
+    {
+        $playlist = create_playlist();
+
+        $this->deleteAs("api/playlists/{$playlist->id}", [], $playlist->owner);
+
+        $this->assertModelMissing($playlist);
+    }
+
+    #[Test]
+    public function nonOwnerCannotDeletePlaylist(): void
+    {
+        $playlist = create_playlist();
+
+        $this->deleteAs("api/playlists/{$playlist->id}")->assertForbidden();
+
+        $this->assertModelExists($playlist);
+    }
+
+    #[Test]
+    public function listingIncludesEditPermissionForOwner(): void
+    {
+        $user = create_user();
+        create_playlists(count: 1, owner: $user);
+
+        $this->getAs('api/playlists', $user)->assertJsonPath('0.permissions.edit', true);
+    }
+
+    #[Test]
+    public function listingIncludesDeletePermissionForOwner(): void
+    {
+        $user = create_user();
+        create_playlists(count: 1, owner: $user);
+
+        $this->getAs('api/playlists', $user)->assertJsonPath('0.permissions.delete', true);
+    }
+
+    #[Test]
+    public function embedPayloadOmitsPermissions(): void
+    {
+        $playlist = create_playlist();
+        $embed = Embed::factory()->for($playlist->owner)->embedding($playlist)->createOne();
+
+        $this
+            ->getJson("api/embeds/{$embed->id}/" . EmbedOptions::make())
+            ->assertSuccessful()
+            ->assertJsonMissingPath('embed.embeddable.permissions');
     }
 }

@@ -2,23 +2,46 @@
 
 namespace App\Http\Controllers;
 
-use App\Factories\StreamerFactory;
+use App\Enums\NativelyPlayableLosslessFormat;
 use App\Http\Requests\SongPlayRequest;
-use App\Models\Song;
+use App\Models\User;
+use App\Repositories\SongRepository;
+use App\Services\Streamer\Streamer;
+use App\Values\RequestedStreamingConfig;
+use Illuminate\Contracts\Auth\Authenticatable;
 
 class PlayController extends Controller
 {
-    private StreamerFactory $streamerFactory;
+    public function __construct(
+        private readonly SongRepository $songRepository,
+    ) {}
 
-    public function __construct(StreamerFactory $streamerFactory)
+    /**
+     * @param User $user
+     * @param ?bool $transcode Whether to **force** transcoding (on mobile devices).
+     */
+    public function __invoke(Authenticatable $user, SongPlayRequest $request, string $songId, ?bool $transcode = null)
     {
-        $this->streamerFactory = $streamerFactory;
-    }
+        $song = $this->songRepository->getOneWithoutRelations($songId);
 
-    public function show(SongPlayRequest $request, Song $song, ?bool $transcode = null, ?int $bitRate = null)
-    {
-        return $this->streamerFactory
-            ->createStreamer($song, $transcode, $bitRate, floatval($request->time))
-            ->stream();
+        if ($song->isEpisode()) {
+            $song->load('podcast');
+        }
+
+        $this->authorize('access', $song);
+
+        // If force transcoding is enabled, use the user's transcoding quality preference.
+        // Otherwise, set this value to null. If the file does indeed need transcoding,
+        // the Streamer will use the config value from .env.
+        $transcodeBitRate = $transcode
+            ? (int) filter_var($user->preferences->transcodeQuality, FILTER_SANITIZE_NUMBER_INT)
+            : null;
+
+        return (new Streamer(song: $song, config: RequestedStreamingConfig::make(
+            transcode: (bool) $transcode,
+            bitRate: $transcodeBitRate,
+            startTime: (float) $request->time,
+            clientLosslessFormats: $request->enums('lossless', NativelyPlayableLosslessFormat::class),
+        )))->stream();
     }
 }

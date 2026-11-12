@@ -1,0 +1,184 @@
+import { describe, expect, it } from 'vite-plus/test'
+import { createHarness } from '@/__tests__/TestHarness'
+import factory from '@/__tests__/factory'
+import { cache } from '@/services/cache'
+import { http } from '@/services/http'
+import { playableStore } from '@/stores/playableStore'
+import { albumStore } from '@/stores/albumStore'
+import { artistStore } from '@/stores/artistStore'
+
+describe('artistStore', () => {
+  const h = createHarness({
+    beforeEach: () => {
+      artistStore.vault.clear()
+      artistStore.state.artists = []
+    },
+  })
+
+  it('removes artists by IDs', () => {
+    const artists = h.factory('artist').make(3)
+    artists.forEach(artist => artistStore.vault.set(artist.id, artist))
+    artistStore.state.artists = artists
+    cache.set(['artist', artists[0].id], artists[0])
+
+    artistStore.removeByIds([artists[0].id, artists[1].id])
+
+    expect(artistStore.vault.size).toBe(1)
+    expect(artistStore.vault.has(artists[0].id)).toBe(false)
+    expect(artistStore.vault.has(artists[1].id)).toBe(false)
+    expect(artistStore.state.artists).toEqual([artists[2]])
+    expect(cache.has(['artist', artists[0].id])).toBe(false)
+  })
+
+  it('identifies an unknown artist', () => {
+    const artist = factory('artist').state('unknown').make()
+
+    expect(artistStore.isUnknown(artist)).toBe(true)
+    expect(artistStore.isUnknown(artist.name)).toBe(true)
+    expect(artistStore.isUnknown(h.factory('artist').make())).toBe(false)
+  })
+
+  it('identifies the various artist', () => {
+    const artist = factory('artist').state('various').make()
+
+    expect(artistStore.isVarious(artist)).toBe(true)
+    expect(artistStore.isVarious(artist.name)).toBe(true)
+    expect(artistStore.isVarious(h.factory('artist').make())).toBe(false)
+  })
+
+  it('identifies a standard artist', () => {
+    expect(artistStore.isStandard(factory('artist').state('unknown').make())).toBe(false)
+    expect(artistStore.isStandard(factory('artist').state('various').make())).toBe(false)
+    expect(artistStore.isStandard(h.factory('artist').make())).toBe(true)
+  })
+
+  it('resolves an artist', async () => {
+    const artist = h.factory('artist').make()
+    const getMock = h.mock(http, 'get').mockResolvedValueOnce(artist)
+
+    expect(await artistStore.resolve(artist.id)).toEqual(artist)
+    expect(getMock).toHaveBeenCalledWith(`artists/${artist.id}`)
+
+    // next call shouldn't make another request
+    expect(await artistStore.resolve(artist.id)).toEqual(artist)
+    expect(getMock).toHaveBeenCalledOnce()
+  })
+
+  it('paginates', async () => {
+    const artists = h.factory('artist').make(3)
+
+    h.mock(http, 'get').mockResolvedValueOnce({
+      data: artists,
+      meta: {
+        path: '/artists',
+        per_page: 21,
+        next_cursor: 'eyJuZXh0Ijoi...',
+        prev_cursor: null,
+      },
+    })
+
+    expect(
+      await artistStore.paginate({
+        favorites_only: false,
+        cursor: '',
+        sort: 'name',
+        order: 'asc',
+      }),
+    ).toEqual('eyJuZXh0Ijoi...')
+
+    expect(artistStore.state.artists).toEqual(artists)
+    expect(artistStore.vault.size).toBe(3)
+  })
+
+  it('toggles favorite', async () => {
+    const artist = h.factory('artist').make({ favorite: false })
+    artistStore.syncWithVault(artist)
+
+    const postMock = h.mock(http, 'post').mockResolvedValueOnce(
+      h.factory('favorite').make({
+        favoriteable_type: 'artist',
+        favoriteable_id: artist.id,
+      }),
+    )
+
+    await artistStore.toggleFavorite(artist)
+
+    expect(postMock).toHaveBeenCalledWith('favorites/toggle', { type: 'artist', id: artist.id })
+    expect(artist.favorite).toBe(true)
+
+    postMock.mockResolvedValue(null)
+    await artistStore.toggleFavorite(artist)
+
+    expect(postMock).toHaveBeenNthCalledWith(2, 'favorites/toggle', { type: 'artist', id: artist.id })
+    expect(artist.favorite).toBe(false)
+  })
+
+  it('updates artist', async () => {
+    const artist = h.factory('artist').make({ name: 'Led Zeppelin' })
+    artistStore.syncWithVault(artist)
+
+    const updatedArtist = {
+      ...artist,
+      name: 'Pink Floyd',
+      image: 'foo',
+    }
+
+    const updateData = {
+      name: 'Pink Floyd',
+      image: 'foo',
+    }
+
+    const putMock = h.mock(http, 'put').mockResolvedValue(updatedArtist)
+    const syncPropsMock = h.mock(playableStore, 'syncArtistProperties')
+    const syncAlbumPropsMock = h.mock(albumStore, 'syncArtistProperties')
+
+    await artistStore.update(artist, updateData)
+
+    expect(putMock).toHaveBeenCalledWith(`artists/${artist.id}`, updateData)
+    expect(syncPropsMock).toHaveBeenCalledWith(updatedArtist)
+    expect(syncAlbumPropsMock).toHaveBeenCalledWith(updatedArtist)
+  })
+
+  it('moves the songs and albums of a merged artist to the kept artist', async () => {
+    const artist = h.factory('artist').make()
+    const keptArtist = h.factory('artist').make()
+    artistStore.syncWithVault(artist)
+    const [mergedAlbum] = albumStore.syncWithVault(
+      h.factory('album').make({ artist_id: artist.id, name: 'Greatest Hits' }),
+    )
+    const keptAlbum = h.factory('album').make({ artist_id: keptArtist.id, name: 'Greatest Hits' })
+    const [song] = playableStore.syncWithVault(
+      h.factory('song').make({ artist_id: artist.id, album_id: mergedAlbum.id }),
+    ) as Song[]
+    h.mock(http, 'put').mockResolvedValueOnce(keptArtist)
+    h.mock(http, 'get').mockResolvedValueOnce([keptAlbum])
+
+    const result = await artistStore.update(artist, { name: keptArtist.name, merge: true })
+
+    expect(result.id).toBe(keptArtist.id)
+    expect(artistStore.byId(artist.id)).toBeUndefined()
+    expect(albumStore.byId(mergedAlbum.id)).toBeUndefined()
+    expect(song.artist_id).toBe(keptArtist.id)
+    expect(song.album_id).toBe(keptAlbum.id)
+  })
+
+  it('favorites several at once', async () => {
+    const artists = h.factory('artist').make({ favorite: false }, 2)
+    const postMock = h.mock(http, 'post')
+
+    await artistStore.favorite(artists)
+
+    expect(postMock).toHaveBeenCalledWith('favorites', { type: 'artist', ids: artists.map(({ id }) => id) })
+    expect(artists.every(({ favorite }) => favorite)).toBe(true)
+  })
+
+  it('undoes favorite of several at once', async () => {
+    const artists = h.factory('artist').make({ favorite: true }, 2)
+    const deleteMock = h.mock(http, 'delete')
+
+    await artistStore.undoFavorite(artists)
+
+    expect(deleteMock).toHaveBeenCalledWith('favorites', { type: 'artist', ids: artists.map(({ id }) => id) })
+    expect(artists.some(({ favorite }) => favorite)).toBe(false)
+  })
+})

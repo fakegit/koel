@@ -2,66 +2,87 @@
 
 namespace App\Models;
 
-use App\Facades\Util;
-use App\Traits\SupportsDeleteWhereIDsNotIn;
-use Illuminate\Database\Eloquent\Builder;
+use App\Builders\ArtistBuilder;
+use App\Facades\License;
+use App\Helpers\Encoding\Bom;
+use App\Models\Concerns\Artists\HasArtistAttributes;
+use App\Models\Concerns\HasMbid;
+use App\Models\Concerns\MorphsToFavorites;
+use App\Models\Concerns\MorphsToRatings;
+use App\Models\Concerns\SupportsDeleteWhereValueNotIn;
+use App\Models\Contracts\Favoriteable;
+use App\Models\Contracts\Rateable;
+use App\Observers\ArtistObserver;
+use Carbon\Carbon;
+use Database\Factories\ArtistFactory;
+use Illuminate\Database\Eloquent\Attributes\Guarded;
+use Illuminate\Database\Eloquent\Attributes\Hidden;
+use Illuminate\Database\Eloquent\Attributes\ObservedBy;
+use Illuminate\Database\Eloquent\Attributes\UseEloquentBuilder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Concerns\HasUlids;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
-use Illuminate\Database\Eloquent\Relations\HasManyThrough;
+use Illuminate\Support\Str;
 use Laravel\Scout\Searchable;
+use OwenIt\Auditing\Auditable;
+use OwenIt\Auditing\Contracts\Auditable as AuditableContract;
 
 /**
- * @property int $id
- * @property string $name
- * @property string|null $image Public URL to the artist's image
+ * @property ?string $image The artist's image file name
+ * @property ?string $description Description written by the user, as sanitized HTML
+ * @property ?string $album_cover For an artist without an image, the cover of the scoped user's most played album
+ * @property ?bool $has_album_cover Whether the artist would get an album_cover, selected where the cover itself isn't
+ * @property Carbon $created_at
+ * @property Collection<array-key, Album> $albums
+ * @property Collection<array-key, Song> $songs
+ * @property User $user
  * @property bool $is_unknown If the artist is Unknown Artist
- * @property bool $is_various If the artist is Various Artist
- * @property Collection $songs
- * @property bool $has_image If the artist has a (non-default) image
- * @property string|null $image_path Absolute path to the artist's image
+ * @property bool $is_various If the artist is Various Artists
+ * @property bool $is_standard If the artist is neither Unknown Artist nor Various Artists
+ * @property int $user_id The ID of the user that owns this artist
+ * @property string $id
+ * @property ?string $mbid The MusicBrainz artist ID
+ * @property string $name
+ * @property ?bool $favorite Whether the artist is liked by the scoped user
+ * @property ?Carbon $favorited_at When the scoped user favorited the artist, if at all
  *
- * @method static self find(int $id)
- * @method static self firstOrCreate(array $where, array $params = [])
- * @method static Builder where(...$params)
- * @method static self first()
- * @method static Builder whereName(string $name)
- * @method static Builder orderBy(...$params)
+ * @method static ArtistFactory factory(...$parameters)
  */
-class Artist extends Model
+#[ObservedBy(ArtistObserver::class)]
+#[UseEloquentBuilder(ArtistBuilder::class)]
+#[Guarded(['id'])]
+#[Hidden(['created_at', 'updated_at'])]
+class Artist extends Model implements AuditableContract, Favoriteable, Rateable
 {
+    use Auditable;
+    use HasArtistAttributes;
+    use HasMbid;
     use HasFactory;
+    use HasUlids;
+    use MorphsToFavorites;
+    use MorphsToRatings;
     use Searchable;
-    use SupportsDeleteWhereIDsNotIn;
+    use SupportsDeleteWhereValueNotIn;
 
-    public const UNKNOWN_ID = 1;
-    public const UNKNOWN_NAME = 'Unknown Artist';
-    public const VARIOUS_ID = 2;
-    public const VARIOUS_NAME = 'Various Artists';
+    public const string UNKNOWN_NAME = 'Unknown Artist';
+    public const string VARIOUS_NAME = 'Various Artists';
 
-    protected $guarded = ['id'];
-    protected $hidden = ['created_at', 'updated_at'];
-
-    public static function getVariousArtist(): self
+    /** @inheritDoc */
+    protected function casts(): array
     {
-        return static::find(self::VARIOUS_ID);
+        return [
+            'favorite' => 'boolean',
+            'favorited_at' => 'datetime',
+        ];
     }
 
-    /**
-     * Get an Artist object from their name.
-     * If such is not found, a new artist will be created.
-     */
-    public static function getOrCreate(?string $name = null): self
+    public static function query(): ArtistBuilder
     {
-        // Remove the BOM from UTF-8/16/32, as it will mess up the database constraints.
-        $encoding = Util::detectUTFEncoding($name);
-
-        if ($encoding) {
-            $name = mb_convert_encoding($name, 'UTF-8', $encoding);
-        }
-
-        return static::firstOrCreate(['name' => trim($name) ?: self::UNKNOWN_NAME]);
+        /** @var ArtistBuilder */
+        return parent::query()->addSelect('artists.*');
     }
 
     public function albums(): HasMany
@@ -69,60 +90,58 @@ class Artist extends Model
         return $this->hasMany(Album::class);
     }
 
-    /**
-     * An artist can have many songs.
-     * Unless he is Rick Astley.
-     */
-    public function songs(): HasManyThrough
+    public function songs(): HasMany
     {
-        return $this->hasManyThrough(Song::class, Album::class);
+        return $this->hasMany(Song::class);
     }
 
-    public function getIsUnknownAttribute(): bool
+    public function user(): BelongsTo
     {
-        return $this->id === self::UNKNOWN_ID;
+        return $this->belongsTo(User::class);
     }
 
-    public function getIsVariousAttribute(): bool
+    public function belongsToUser(User $user): bool
     {
-        return $this->id === self::VARIOUS_ID;
+        return $this->user_id === $user->id;
     }
 
     /**
-     * Sometimes the tags extracted from getID3 are HTML entity encoded.
-     * This makes sure they are always sane.
+     * Get an Artist object from their name (and if Koel Plus, belonging to a specific user).
+     * If such is not found, a new artist will be created.
      */
-    public function getNameAttribute(string $value): string
+    private static function normalizeName(?string $name): string
     {
-        return html_entity_decode($value ?: self::UNKNOWN_NAME);
+        $name = trim(Bom::strip($name) ?? '') ?: self::UNKNOWN_NAME;
+
+        return in_array(Str::lower($name), ['various artists', 'va'], true) ? self::VARIOUS_NAME : $name;
     }
 
-    /**
-     * Turn the image name into its absolute URL.
-     */
-    public function getImageAttribute(?string $value): ?string
+    public static function getOrCreate(User $user, ?string $name = null): self
     {
-        return $value ? artist_image_url($value) : null;
-    }
+        $name = self::normalizeName($name);
 
-    public function getImagePathAttribute(): ?string
-    {
-        if (!$this->has_image) {
-            return null;
+        // In the Community license, all artists are shared, so we determine the first artist by the name only.
+        // In the Plus license, artists are user-specific, so we create or return the artist for the given user.
+        $where = ['name' => $name];
+
+        if (License::isPlus()) {
+            $where['user_id'] = $user->id;
         }
 
-        return artist_image_path(array_get($this->attributes, 'image'));
+        return static::query()
+            ->where($where)
+            ->firstOr(static function () use ($user, $name): Artist {
+                return static::query()
+                    ->create([
+                        'user_id' => $user->id,
+                        'name' => $name,
+                    ]);
+            });
     }
 
-    public function getHasImageAttribute(): bool
+    public function shouldBeSearchable(): bool
     {
-        $image = array_get($this->attributes, 'image');
-
-        if (!$image) {
-            return false;
-        }
-
-        return file_exists(artist_image_path($image));
+        return $this->is_standard;
     }
 
     /** @return array<mixed> */
@@ -130,6 +149,7 @@ class Artist extends Model
     {
         return [
             'id' => $this->id,
+            'user_id' => $this->user_id,
             'name' => $this->name,
         ];
     }

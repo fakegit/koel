@@ -3,24 +3,13 @@
 namespace App\Observers;
 
 use App\Models\Song;
-use App\Services\HelperService;
 
 class SongObserver
 {
-    private HelperService $helperService;
-
-    public function __construct(HelperService $helperService)
+    public function saving(Song $song): void
     {
-        $this->helperService = $helperService;
-    }
-
-    public function creating(Song $song): void
-    {
-        $this->setFileHashAsId($song);
-    }
-
-    private function setFileHashAsId(Song $song): void
-    {
-        $song->id = $this->helperService->getFileHash($song->path);
+        if ($song->isDirty('path')) {
+            $song->path_hash = simple_hash($song->path);
+        }
     }
 }

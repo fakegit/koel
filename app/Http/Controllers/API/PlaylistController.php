@@ -2,66 +2,66 @@
 
 namespace App\Http\Controllers\API;
 
-use App\Http\Requests\API\PlaylistStoreRequest;
-use App\Http\Requests\API\PlaylistUpdateRequest;
+use App\Exceptions\PlaylistBothSongsAndRulesProvidedException;
+use App\Http\Controllers\Controller;
+use App\Http\Requests\API\Playlist\PlaylistStoreRequest;
+use App\Http\Requests\API\Playlist\PlaylistUpdateRequest;
+use App\Http\Resources\PlaylistResource;
 use App\Models\Playlist;
 use App\Models\User;
+use App\Repositories\PlaylistFolderRepository;
 use App\Repositories\PlaylistRepository;
-use App\Services\PlaylistService;
+use App\Services\Playlist\PlaylistService;
 use Illuminate\Contracts\Auth\Authenticatable;
+use Illuminate\Validation\ValidationException;
 
 class PlaylistController extends Controller
 {
-    private PlaylistRepository $playlistRepository;
-    private PlaylistService $playlistService;
-
-    /** @var User */
-    private ?Authenticatable $currentUser;
-
+    /** @param User $user */
     public function __construct(
-        PlaylistRepository $playlistRepository,
-        PlaylistService $playlistService,
-        ?Authenticatable $currentUser
-    ) {
-        $this->playlistRepository = $playlistRepository;
-        $this->playlistService = $playlistService;
-        $this->currentUser = $currentUser;
-    }
+        private readonly PlaylistService $playlistService,
+        private readonly PlaylistRepository $playlistRepository,
+        private readonly PlaylistFolderRepository $folderRepository,
+        private readonly Authenticatable $user,
+    ) {}
 
     public function index()
     {
-        return response()->json($this->playlistRepository->getAllByCurrentUser());
+        return PlaylistResource::collection($this->playlistRepository->getAllAccessibleByUser($this->user));
     }
 
     public function store(PlaylistStoreRequest $request)
     {
-        $playlist = $this->playlistService->createPlaylist(
-            $request->name,
-            $this->currentUser,
-            (array) $request->songs,
-            $request->rules
-        );
+        if ($request->folder_id) {
+            $this->authorize('own', $this->folderRepository->getOne($request->folder_id));
+        }
 
-        $playlist->songs = $playlist->songs->pluck('id')->toArray();
+        try {
+            $playlist = $this->playlistService->createPlaylist($request->toDto(), $this->user);
 
-        return response()->json($playlist);
+            return PlaylistResource::make($playlist);
+        } catch (PlaylistBothSongsAndRulesProvidedException $e) {
+            throw ValidationException::withMessages(['songs' => [$e->getMessage()]]);
+        }
     }
 
     public function update(PlaylistUpdateRequest $request, Playlist $playlist)
     {
-        $this->authorize('owner', $playlist);
+        $this->authorize('own', $playlist);
 
-        $playlist->update($request->only('name', 'rules'));
+        if ($request->folder_id) {
+            $this->authorize('own', $this->folderRepository->getOne($request->folder_id));
+        }
 
-        return response()->json($playlist);
+        return PlaylistResource::make($this->playlistService->updatePlaylist($playlist, $request->toDto()));
     }
 
     public function destroy(Playlist $playlist)
     {
-        $this->authorize('owner', $playlist);
+        $this->authorize('own', $playlist);
 
-        $playlist->delete();
+        $this->playlistService->deletePlaylist($playlist);
 
-        return response()->json();
+        return response()->noContent();
     }
 }

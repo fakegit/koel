@@ -2,15 +2,14 @@
 
 namespace Tests\Integration\Services;
 
-use App\Events\SongLikeToggled;
-use App\Events\SongsBatchLiked;
-use App\Events\SongsBatchUnliked;
 use App\Models\Interaction;
+use App\Models\Play;
 use App\Models\Song;
-use App\Models\User;
 use App\Services\InteractionService;
-use Illuminate\Support\Collection;
+use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
+
+use function Tests\create_user;
 
 class InteractionServiceTest extends TestCase
 {
@@ -20,67 +19,38 @@ class InteractionServiceTest extends TestCase
     {
         parent::setUp();
 
-        $this->interactionService = new InteractionService();
+        $this->interactionService = app(InteractionService::class);
     }
 
-    public function testIncreasePlayCount(): void
+    #[Test]
+    public function increasePlayCount(): void
     {
-        /** @var Interaction $interaction */
-        $interaction = Interaction::factory()->create();
-
+        $interaction = Interaction::factory()->createOne();
+        $currentCount = $interaction->play_count;
         $this->interactionService->increasePlayCount($interaction->song, $interaction->user);
 
-        $updatedInteraction = Interaction::find($interaction->id);
-        self::assertEquals($interaction->play_count + 1, $updatedInteraction->play_count);
+        self::assertSame($currentCount + 1, $interaction->refresh()->play_count);
     }
 
-    public function testToggleLike(): void
+    #[Test]
+    public function logEachSongPlay(): void
     {
-        $this->expectsEvents(SongLikeToggled::class);
+        $song = Song::factory()->createOne();
+        $user = create_user();
 
-        /** @var Interaction $interaction */
-        $interaction = Interaction::factory()->create();
+        $this->interactionService->increasePlayCount($song, $user);
+        $this->interactionService->increasePlayCount($song, $user);
 
-        $this->interactionService->toggleLike($interaction->song, $interaction->user);
-
-        $updatedInteraction = Interaction::find($interaction->id);
-        self::assertNotSame($interaction->liked, $updatedInteraction->liked);
+        self::assertSame(2, Play::query()->whereBelongsTo($user)->whereBelongsTo($song)->count());
     }
 
-    public function testLikeMultipleSongs(): void
+    #[Test]
+    public function doNotLogEpisodePlays(): void
     {
-        $this->expectsEvents(SongsBatchLiked::class);
+        $episode = Song::factory()->asEpisode()->createOne();
 
-        /** @var Collection $songs */
-        $songs = Song::factory(2)->create();
+        $this->interactionService->increasePlayCount($episode, create_user());
 
-        /** @var User $user */
-        $user = User::factory()->create();
-
-        $this->interactionService->batchLike($songs->pluck('id')->all(), $user);
-
-        $songs->each(static function (Song $song) use ($user): void {
-            self::assertTrue(Interaction::whereSongIdAndUserId($song->id, $user->id)->first()->liked);
-        });
-    }
-
-    public function testUnlikeMultipleSongs(): void
-    {
-        $this->expectsEvents(SongsBatchUnliked::class);
-
-        /** @var User $user */
-        $user = User::factory()->create();
-
-        /** @var Collection $interactions */
-        $interactions = Interaction::factory(3)->create([
-            'user_id' => $user->id,
-            'liked' => true,
-        ]);
-
-        $this->interactionService->batchUnlike($interactions->pluck('song.id')->all(), $user);
-
-        $interactions->each(static function (Interaction $interaction): void {
-            self::assertFalse(Interaction::find($interaction->id)->liked);
-        });
+        self::assertSame(0, Play::query()->count());
     }
 }

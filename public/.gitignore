@@ -1,6 +1,18 @@
-css
+css/*
+!css/layer-order.css
 fonts
-img
+
+# Ignore all (generated) images under img/, but keep the folder structure
+img/*
+!img/icon.png
+!img/favicon.ico
+
+!img/storage
+img/storage/*
+!img/storage/.gitkeep
+
+vendor/*
+
 images
 js
 manifest.json
@@ -8,3 +20,5 @@ manifest-remote.json
 hot
 mix-manifest.json
 .user.ini
+build
+.htaccess

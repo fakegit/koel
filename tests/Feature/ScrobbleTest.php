@@ -2,30 +2,78 @@
 
 namespace Tests\Feature;
 
+use App\Facades\Dispatcher;
+use App\Jobs\ScrobbleJob;
+use App\Models\Artist;
 use App\Models\Song;
-use App\Models\User;
-use App\Services\LastfmService;
+use PHPUnit\Framework\Attributes\Test;
+use Tests\TestCase;
+
+use function Tests\create_user;
 
 class ScrobbleTest extends TestCase
 {
-    public function testLastfmScrobble(): void
+    #[Test]
+    public function lastfmScrobble(): void
     {
-        $this->withoutEvents();
+        $user = create_user();
+        $song = Song::factory()->createOne();
 
-        /** @var User $user */
-        $user = User::factory()->create();
+        Dispatcher::expects('dispatch')->andReturnUsing(function (ScrobbleJob $job) use ($song, $user): void {
+            $this->assertTrue($song->is($job->song));
+            $this->assertTrue($user->is($job->user));
+            self::assertEquals(100, $job->timestamp);
+        });
 
-        /** @var Song $song */
-        $song = Song::factory()->create();
+        $this->postAs("/api/songs/{$song->id}/scrobble", ['timestamp' => 100], $user)->assertNoContent();
+    }
 
-        $timestamp = time();
+    #[Test]
+    public function listenBrainzScrobble(): void
+    {
+        $user = create_user(['preferences' => ['listenbrainz_token' => 'my_token']]);
+        $song = Song::factory()->createOne();
 
-        self::mock(LastfmService::class)
-            ->shouldReceive('scrobble')
-            ->with($song->album->artist->name, $song->title, $timestamp, $song->album->name, $user->lastfm_session_key)
-            ->once();
+        Dispatcher::expects('dispatch')->andReturnUsing(function (ScrobbleJob $job) use ($song, $user): void {
+            $this->assertTrue($song->is($job->song));
+            $this->assertTrue($user->is($job->user));
+            self::assertEquals(100, $job->timestamp);
+        });
 
-        $this->postAsUser("/api/$song->id/scrobble", ['timestamp' => $timestamp], $user)
-            ->assertNoContent();
+        $this->postAs("/api/songs/{$song->id}/scrobble", ['timestamp' => 100], $user)->assertNoContent();
+    }
+
+    #[Test]
+    public function noScrobbleWithoutAConnectedService(): void
+    {
+        $user = create_user(['preferences' => []]);
+        $song = Song::factory()->createOne();
+
+        Dispatcher::expects('dispatch')->never();
+
+        $this->postAs("/api/songs/{$song->id}/scrobble", ['timestamp' => 100], $user)->assertNoContent();
+    }
+
+    #[Test]
+    public function noScrobbleForUnknownArtist(): void
+    {
+        $user = create_user(['preferences' => ['listenbrainz_token' => 'my_token']]);
+        $artist = Artist::factory()->createOne(['name' => Artist::UNKNOWN_NAME]);
+        $song = Song::factory()->for($artist)->createOne();
+
+        Dispatcher::expects('dispatch')->never();
+
+        $this->postAs("/api/songs/{$song->id}/scrobble", ['timestamp' => 100], $user)->assertNoContent();
+    }
+
+    #[Test]
+    public function noScrobbleForPodcastEpisode(): void
+    {
+        $user = create_user(['preferences' => ['listenbrainz_token' => 'my_token']]);
+        $episode = Song::factory()->asEpisode()->createOne();
+
+        Dispatcher::expects('dispatch')->never();
+
+        $this->postAs("/api/songs/{$episode->id}/scrobble", ['timestamp' => 100], $user)->assertNoContent();
     }
 }

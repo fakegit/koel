@@ -2,21 +2,25 @@
 
 namespace App\Listeners;
 
-use App\Events\SongsBatchUnliked;
-use App\Services\LastfmService;
+use App\Events\MultipleSongsUnliked;
+use App\Models\Song;
+use App\Services\Integrations\LastfmService;
 use Illuminate\Contracts\Queue\ShouldQueue;
 
-class UnloveMultipleTracksOnLastfm implements ShouldQueue
+readonly class UnloveMultipleTracksOnLastfm implements ShouldQueue
 {
-    private LastfmService $lastfm;
+    public function __construct(
+        private LastfmService $lastfm,
+    ) {}
 
-    public function __construct(LastfmService $lastfm)
+    public function handle(MultipleSongsUnliked $event): void
     {
-        $this->lastfm = $lastfm;
-    }
+        $songs = $event->songs->filter(static fn (Song $song) => $song->isScrobbleable());
 
-    public function handle(SongsBatchUnliked $event): void
-    {
-        $this->lastfm->batchToggleLoveTracks($event->songs, $event->user, false);
+        if ($songs->isEmpty() || !$this->lastfm->isConnected($event->user)) {
+            return;
+        }
+
+        $this->lastfm->batchToggleLoveTracks($songs, $event->user, false);
     }
 }

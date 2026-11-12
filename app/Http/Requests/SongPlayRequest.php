@@ -2,10 +2,21 @@
 
 namespace App\Http\Requests;
 
+use App\Enums\NativelyPlayableLosslessFormat;
+use Illuminate\Validation\Rule;
+
 /**
- * @property float $time
- * @property string $api_token
+ * @property-read float|string $time
+ * @property-read string $api_token
  */
-class SongPlayRequest extends AbstractRequest
+class SongPlayRequest extends Request
 {
+    /** @inheritdoc */
+    public function rules(): array
+    {
+        return [
+            'lossless' => [Rule::sometimes(), Rule::array()],
+            'lossless.*' => [Rule::enum(NativelyPlayableLosslessFormat::class)],
+        ];
+    }
 }

@@ -3,15 +3,16 @@
 namespace App\Http\Requests\API\ObjectStorage;
 
 use App\Http\Requests\API\Request as BaseRequest;
+use Illuminate\Validation\Rule;
 
 class Request extends BaseRequest
 {
-    /** @return array<mixed> */
+    /** @inheritdoc */
     public function rules(): array
     {
         return [
-            'bucket' => 'required',
-            'key' => 'required',
+            'bucket' => [Rule::required()],
+            'key' => [Rule::required()],
         ];
     }
 }

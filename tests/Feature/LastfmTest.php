@@ -2,127 +2,129 @@
 
 namespace Tests\Feature;
 
+use App\Http\Integrations\Lastfm\Requests\GetSessionKeyRequest;
 use App\Models\User;
-use App\Services\LastfmService;
-use App\Services\TokenManager;
-use GuzzleHttp\Client;
-use GuzzleHttp\Psr7\Response;
-use Illuminate\Contracts\Cache\Repository as Cache;
-use Illuminate\Log\Logger;
-use Laravel\Sanctum\NewAccessToken;
-use Laravel\Sanctum\PersonalAccessToken;
-use Mockery;
-use Mockery\MockInterface;
+use Illuminate\Http\Response;
+use Illuminate\Support\Uri;
+use PHPUnit\Framework\Attributes\Test;
+use Saloon\Http\Faking\MockResponse;
+use Saloon\Laravel\Saloon;
+use Tests\TestCase;
+
+use function Tests\create_user;
 
 class LastfmTest extends TestCase
 {
-    public function testGetSessionKey(): void
+    #[Test]
+    public function setSessionKey(): void
     {
-        /** @var Client $client */
-        $client = Mockery::mock(Client::class, [
-            'get' => new Response(200, [], file_get_contents(__DIR__ . '../../blobs/lastfm/session-key.json')),
-        ]);
+        $user = create_user();
+        $this->postAs('api/lastfm/session-key', ['key' => 'foo'], $user)->assertNoContent();
 
-        $service = new LastfmService($client, app(Cache::class), app(Logger::class));
-        self::assertEquals('foo', $service->getSessionKey('bar'));
+        static::assertSame('foo', $user->refresh()->preferences->lastFmSessionKey);
     }
 
-    public function testSetSessionKey(): void
+    #[Test]
+    public function getAuthorizationUrl(): void
     {
-        /** @var User $user */
-        $user = User::factory()->create();
-        $this->postAsUser('api/lastfm/session-key', ['key' => 'foo'], $user)
-            ->assertStatus(204);
+        $user = create_user();
+        $url = $this->getAs('api/lastfm/authorization-url', $user)->assertOk()->json('url');
 
-        self::assertEquals('foo', $user->refresh()->lastfm_session_key);
+        $authorizationUri = Uri::of($url);
+        $callbackUri = Uri::of($authorizationUri->query()->get('cb'));
+
+        self::assertSame('https://www.last.fm/api/auth/', $authorizationUri->withQuery([], false)->value());
+        self::assertSame('foo', $authorizationUri->query()->get('api_key'));
+        self::assertSame('lastfm/callback', $callbackUri->path());
+        self::assertSame(['state'], array_keys($callbackUri->query()->all()));
+        self::assertSame(1, $user->tokens()->count());
     }
 
-    public function testConnectToLastfm(): void
+    #[Test]
+    public function getAuthorizationUrlWhenLastfmIsNotConfigured(): void
     {
-        /** @var User $user */
-        $user = User::factory()->create();
-        $token = $user->createToken('Koel')->plainTextToken;
+        config(['koel.services.lastfm.secret' => null]);
 
-        /** @var NewAccessToken|MockInterface $temporaryToken */
-        $temporaryToken = Mockery::mock(NewAccessToken::class);
-        $temporaryToken->plainTextToken = 'tmp-token';
-
-        $tokenManager = self::mock(TokenManager::class);
-
-        $tokenManager->shouldReceive('getUserFromPlainTextToken')
-            ->with($token)
-            ->andReturn($user);
-
-        $tokenManager->shouldReceive('createToken')
-            ->once()
-            ->with($user)
-            ->andReturn($temporaryToken);
-
-        $this->get('lastfm/connect?api_token=' . $token)
-            ->assertRedirect(
-                'https://www.last.fm/api/auth/?api_key=foo&cb=http%3A%2F%2Flocalhost%2Flastfm%2Fcallback%3Fapi_token%3Dtmp-token' // @phpcs-ignore-line
-            );
+        $this->getAs('api/lastfm/authorization-url')->assertStatus(Response::HTTP_NOT_IMPLEMENTED);
     }
 
-    public function testCallback(): void
+    #[Test]
+    public function callbackStoresSessionKeyForTheUserWhoStartedTheFlow(): void
     {
-        /** @var User $user */
-        $user = User::factory()->create();
-        $token = $user->createToken('Koel')->plainTextToken;
+        $user = create_user();
+        $state = $this->startConnectFlow($user);
 
-        self::assertNotNull(PersonalAccessToken::findToken($token));
+        self::fakeSessionKeyExchange('my-session-key');
 
-        $lastfm = Mockery::mock(LastfmService::class)->makePartial();
+        $this->get("lastfm/callback?token=lastfm-token&state=$state")->assertOk();
 
-        $lastfm->shouldReceive('getSessionKey')
-            ->with('lastfm-token')
-            ->once()
-            ->andReturn('my-session-key');
-
-        app()->instance(LastfmService::class, $lastfm);
-
-        $this->get('lastfm/callback?token=lastfm-token&api_token=' . urlencode($token))
-            ->assertOk();
-
-        self::assertSame('my-session-key', $user->refresh()->lastfm_session_key);
-        // make sure the user's api token is deleted
-        self::assertNull(PersonalAccessToken::findToken($token));
+        self::assertSame('my-session-key', $user->refresh()->preferences->lastFmSessionKey);
     }
 
-    public function testRetrieveAndStoreSessionKey(): void
+    #[Test]
+    public function callbackRejectsUnknownState(): void
     {
-        /** @var User $user */
-        $user = User::factory()->create();
-
-        $lastfm = Mockery::mock(LastfmService::class)->makePartial();
-
-        $lastfm->shouldReceive('getSessionKey')
-            ->once()
-            ->with('foo')
-            ->andReturn('my-session-key');
-
-        app()->instance(LastfmService::class, $lastfm);
-
-        $tokenManager = self::mock(TokenManager::class);
-
-        $tokenManager->shouldReceive('getUserFromPlainTextToken')
-            ->once()
-            ->with('my-token')
-            ->andReturn($user);
-
-        $this->get('lastfm/callback?token=foo&api_token=my-token');
-
-        self::assertEquals('my-session-key', $user->refresh()->lastfm_session_key);
+        $this->get('lastfm/callback?token=lastfm-token&state=unknown')->assertForbidden();
     }
 
-    public function testDisconnectUser(): void
+    #[Test]
+    public function callbackRejectsReusedState(): void
     {
-        /** @var User $user */
-        $user = User::factory()->create();
-        self::assertNotNull($user->lastfm_session_key);
-        $this->deleteAsUser('api/lastfm/disconnect', [], $user);
+        $state = $this->startConnectFlow(create_user());
+
+        self::fakeSessionKeyExchange('my-session-key');
+
+        $this->get("lastfm/callback?token=lastfm-token&state=$state")->assertOk();
+        $this->get("lastfm/callback?token=lastfm-token&state=$state")->assertForbidden();
+    }
+
+    #[Test]
+    public function callbackRejectsExpiredState(): void
+    {
+        $state = $this->startConnectFlow(create_user());
+
+        $this->travel(11)->minutes();
+
+        $this->get("lastfm/callback?token=lastfm-token&state=$state")->assertForbidden();
+    }
+
+    #[Test]
+    public function failedSessionKeyExchangeStillConsumesState(): void
+    {
+        $user = create_user(['preferences' => ['lastfm_session_key' => null]]);
+        $state = $this->startConnectFlow($user);
+
+        self::fakeSessionKeyExchange(null);
+
+        $this->get("lastfm/callback?token=bad-token&state=$state")->assertServerError();
+        $this->get("lastfm/callback?token=bad-token&state=$state")->assertForbidden();
+
+        self::assertNull($user->refresh()->preferences->lastFmSessionKey);
+    }
+
+    #[Test]
+    public function disconnectUser(): void
+    {
+        $user = create_user();
+        static::assertNotNull($user->preferences->lastFmSessionKey);
+
+        $this->deleteAs('api/lastfm/disconnect', [], $user);
+
         $user->refresh();
+        static::assertNull($user->preferences->lastFmSessionKey);
+    }
 
-        self::assertNull($user->lastfm_session_key);
+    private function startConnectFlow(User $user): string
+    {
+        $url = $this->getAs('api/lastfm/authorization-url', $user)->json('url');
+
+        return Uri::of(Uri::of($url)->query()->get('cb'))->query()->get('state');
+    }
+
+    private static function fakeSessionKeyExchange(?string $sessionKey): void
+    {
+        $body = $sessionKey ? ['session' => ['key' => $sessionKey]] : ['error' => 4, 'message' => 'Invalid token'];
+
+        Saloon::fake([GetSessionKeyRequest::class => MockResponse::make($body)]);
     }
 }

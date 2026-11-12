@@ -5,56 +5,100 @@ namespace App\Services;
 use App\Models\Album;
 use App\Models\Artist;
 use App\Models\Song;
+use App\Models\User;
 use App\Repositories\AlbumRepository;
 use App\Repositories\ArtistRepository;
+use App\Repositories\PodcastRepository;
+use App\Repositories\RadioStationRepository;
 use App\Repositories\SongRepository;
-use Illuminate\Database\Eloquent\Model;
+use App\Values\ExcerptSearchResult;
 use Illuminate\Support\Collection;
-use Laravel\Scout\Builder;
+use Illuminate\Support\Facades\Log;
+use Throwable;
 
 class SearchService
 {
-    public const DEFAULT_EXCERPT_RESULT_COUNT = 6;
-
-    private SongRepository $songRepository;
-    private AlbumRepository $albumRepository;
-    private ArtistRepository $artistRepository;
+    public const int DEFAULT_EXCERPT_RESULT_LIMIT = 6;
+    public const int DEFAULT_SONG_RESULT_LIMIT = 500;
+    public const int DEFAULT_LIST_FILTER_RESULT_LIMIT = 100;
 
     public function __construct(
-        SongRepository $songRepository,
-        AlbumRepository $albumRepository,
-        ArtistRepository $artistRepository
-    ) {
-        $this->songRepository = $songRepository;
-        $this->albumRepository = $albumRepository;
-        $this->artistRepository = $artistRepository;
+        private readonly SongRepository $songRepository,
+        private readonly ArtistRepository $artistRepository,
+        private readonly AlbumRepository $albumRepository,
+        private readonly PodcastRepository $podcastRepository,
+        private readonly RadioStationRepository $radioStationRepository,
+    ) {}
+
+    public function excerptSearch(
+        string $keywords,
+        int $limit = self::DEFAULT_EXCERPT_RESULT_LIMIT,
+        ?User $scopedUser = null,
+    ): ExcerptSearchResult {
+        $scopedUser ??= auth()->user();
+
+        $results = [];
+
+        foreach ([
+            $this->songRepository,
+            $this->artistRepository,
+            $this->albumRepository,
+            $this->podcastRepository,
+            $this->radioStationRepository,
+        ] as $repository) {
+            try {
+                $results[] = $repository->search($keywords, $limit, $scopedUser);
+            } catch (Throwable $e) {
+                Log::error('Scout search failed', ['exception' => $e]);
+                $results[] = new Collection();
+            }
+        }
+
+        return ExcerptSearchResult::make(...$results);
     }
 
-    /** @return array<mixed> */
-    public function excerptSearch(string $keywords, int $count): array
-    {
-        return [
-            'songs' => self::getTopResults($this->songRepository->search($keywords), $count)
-                ->map(static fn (Song $song): string => $song->id),
-            'artists' => self::getTopResults($this->artistRepository->search($keywords), $count)
-                ->map(static fn (Artist $artist): int => $artist->id),
-            'albums' => self::getTopResults($this->albumRepository->search($keywords), $count)
-                ->map(static fn (Album $album): int => $album->id),
-        ];
+    /** @return Collection|array<array-key, Song> */
+    public function searchSongs(
+        string $keywords,
+        ?User $scopedUser = null,
+        int $limit = self::DEFAULT_SONG_RESULT_LIMIT,
+    ): Collection {
+        return $this->songRepository->search($keywords, $limit, $scopedUser);
     }
 
-    /** @return Collection|array<Model> */
-    private static function getTopResults(Builder $query, int $count): Collection
-    {
-        return $query->take($count)->get();
+    /** @return Collection<int, Album> */
+    public function searchAlbums(
+        string $keywords,
+        ?User $scopedUser = null,
+        bool $favoritesOnly = false,
+        int $limit = self::DEFAULT_LIST_FILTER_RESULT_LIMIT,
+    ): Collection {
+        if (!$favoritesOnly) {
+            return $this->albumRepository->search($keywords, $limit, $scopedUser);
+        }
+
+        return $this->albumRepository
+            ->search($keywords, PHP_INT_MAX, $scopedUser)
+            ->filter(static fn (Album $album) => $album->favorite)
+            ->take($limit)
+            ->values();
     }
 
-    /** @return Collection|array<string> */
-    public function searchSongs(string $keywords): Collection
-    {
-        return $this->songRepository
-            ->search($keywords)
-            ->get()
-            ->map(static fn (Song $song): string => $song->id);
+    /** @return Collection<int, Artist> */
+    public function searchArtists(
+        string $keywords,
+        ?User $scopedUser = null,
+        bool $favoritesOnly = false,
+        int $limit = self::DEFAULT_LIST_FILTER_RESULT_LIMIT,
+    ): Collection {
+        if (!$favoritesOnly) {
+            return $this->artistRepository->search($keywords, $limit, $scopedUser);
+        }
+
+        return $this->artistRepository
+            ->search($keywords, PHP_INT_MAX, $scopedUser)
+            ->filter(static fn (Artist $artist) => $artist->favorite)
+            ->take($limit)
+            ->values();
     }
 }

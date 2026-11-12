@@ -2,50 +2,55 @@
 
 namespace App\Http\Controllers\API;
 
+use App\Exceptions\UserProspectUpdateDeniedException;
+use App\Http\Controllers\Controller;
 use App\Http\Requests\API\UserStoreRequest;
 use App\Http\Requests\API\UserUpdateRequest;
+use App\Http\Resources\UserResource;
 use App\Models\User;
-use Illuminate\Contracts\Hashing\Hasher as Hash;
+use App\Repositories\UserRepository;
+use App\Services\UserService;
+use Illuminate\Contracts\Auth\Authenticatable;
 use Illuminate\Http\Response;
 
 class UserController extends Controller
 {
-    private Hash $hash;
+    public function __construct(
+        private readonly UserRepository $userRepository,
+        private readonly UserService $userService,
+    ) {}
 
-    public function __construct(Hash $hash)
+    /** @param User $user */
+    public function index(Authenticatable $user)
     {
-        $this->hash = $hash;
+        $this->authorize('manage', User::class);
+
+        return UserResource::collection($this->userRepository->getAllInOrganization($user->organization));
     }
 
     public function store(UserStoreRequest $request)
     {
-        return response()->json(User::create([
-            'name' => $request->name,
-            'email' => $request->email,
-            'password' => $this->hash->make($request->password),
-            'is_admin' => $request->is_admin,
-        ]));
+        $this->authorize('manage', User::class);
+
+        return UserResource::make($this->userService->createUser($request->toDto()));
     }
 
     public function update(UserUpdateRequest $request, User $user)
     {
-        $data = $request->only('name', 'email', 'is_admin');
+        $this->authorize('update', $user);
 
-        if ($request->password) {
-            $data['password'] = $this->hash->make($request->password);
+        try {
+            return UserResource::make($this->userService->updateUser($user, $request->toDto()));
+        } catch (UserProspectUpdateDeniedException) {
+            abort(Response::HTTP_FORBIDDEN, 'Cannot update a user prospect.');
         }
-
-        $user->update($data);
-
-        return response()->json($user);
     }
 
     public function destroy(User $user)
     {
         $this->authorize('destroy', $user);
+        $this->userService->scheduleUserDeletion($user);
 
-        $user->delete();
-
-        return response()->json(null, Response::HTTP_NO_CONTENT);
+        return response()->noContent();
     }
 }

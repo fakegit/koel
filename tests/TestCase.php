@@ -2,63 +2,89 @@
 
 namespace Tests;
 
+use App\Facades\License;
+use App\Helpers\Ulid;
+use App\Helpers\Uuid;
 use App\Models\Album;
-use App\Models\Artist;
-use App\Models\Song;
-use DMS\PHPUnitExtensions\ArraySubset\ArraySubsetAsserts;
-use Illuminate\Foundation\Testing\DatabaseTransactions;
+use App\Observers\AlbumObserver;
+use App\Services\Image\ImageStorage;
+use App\Services\Integrations\MusicBrainzRateLimiter;
+use App\Services\License\CommunityLicenseService;
+use App\Services\MediaBrowser;
+use App\Services\Network\Network;
+use Illuminate\Filesystem\Filesystem;
+use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Foundation\Testing\TestCase as BaseTestCase;
-use ReflectionClass;
-use Tests\Traits\CreatesApplication;
-use Tests\Traits\SandboxesTests;
+use Illuminate\Support\Facades\File;
+use Tests\Concerns\AssertsArraySubset;
+use Tests\Concerns\CreatesApplication;
+use Tests\Concerns\MakesHttpRequests;
+use Tests\Fakes\FakeNetwork;
 
 abstract class TestCase extends BaseTestCase
 {
-    use ArraySubsetAsserts;
+    use AssertsArraySubset;
     use CreatesApplication;
-    use DatabaseTransactions;
-    use SandboxesTests;
+    use LazilyRefreshDatabase;
+    use MakesHttpRequests;
+
+    /**
+     * @var Filesystem The backup of the real filesystem instance, to restore after tests.
+     * This is necessary because we might be mocking the File facade in tests, and at the same time
+     * we delete test resources during suite's teardown.
+     */
+    private Filesystem $fileSystem;
 
     public function setUp(): void
     {
         parent::setUp();
 
-        $this->prepareForTests();
+        License::swap($this->app->make(CommunityLicenseService::class));
+        $this->app->instance(Network::class, new FakeNetwork());
+        $this->app->instance(MusicBrainzRateLimiter::class, new MusicBrainzRateLimiter(requestIntervalSeconds: 0));
+        $this->fileSystem = File::getFacadeRoot();
+
+        // Replace the AlbumObserver with a partial that skips the `saved` event (which dispatches
+        // thumbnail generation jobs). All other observer methods are preserved.
+        // Tests that verify the `saved` behavior can re-bind the real observer.
+        $observerStorage = $this->app->make(ImageStorage::class);
+
+        $this->app->instance(AlbumObserver::class, new class($observerStorage) extends AlbumObserver {
+            public function saved(Album $album): void
+            {
+                // no-op: prevent thumbnail job dispatch noise in tests
+            }
+        });
+
         self::createSandbox();
     }
 
     protected function tearDown(): void
     {
+        File::swap($this->fileSystem);
         self::destroySandbox();
+        MediaBrowser::clearCache();
+
+        Ulid::unfreeze();
+        Uuid::unfreeze();
 
         parent::tearDown();
     }
 
-    protected static function createSampleMediaSet(): void
+    private static function createSandbox(): void
     {
-        /** @var Artist $artist */
-        $artist = Artist::factory()->create();
-
-        /** @var array<Album> $albums */
-        $albums = Album::factory(3)->create([
-            'artist_id' => $artist->id,
+        config([
+            'koel.image_storage_dir' => sandbox_dir() . '/img/storage',
+            'koel.artifacts_path' => sandbox_path('artifacts/'),
+            'filesystems.disks.images.root' => public_path(sandbox_dir() . '/img/storage'),
         ]);
 
-        // 7-15 songs per albums
-        foreach ($albums as $album) {
-            Song::factory(random_int(7, 15))->create([
-                'album_id' => $album->id,
-                'artist_id' => $artist->id,
-            ]);
-        }
+        File::ensureDirectoryExists(public_path(config('koel.image_storage_dir')));
+        File::ensureDirectoryExists(sandbox_path('media/'));
     }
 
-    protected static function getNonPublicProperty($object, string $property) // @phpcs:ignore
+    private static function destroySandbox(): void
     {
-        $reflection = new ReflectionClass($object);
-        $property = $reflection->getProperty($property);
-        $property->setAccessible(true);
-
-        return $property->getValue($object);
+        File::deleteDirectory(sandbox_path());
     }
 }

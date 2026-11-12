@@ -2,61 +2,140 @@
 
 namespace Tests\Feature;
 
-use App\Models\User;
-use Illuminate\Http\Response;
-use Illuminate\Support\Facades\Hash;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Test;
+use Tests\TestCase;
+
+use function Tests\create_user;
+use function Tests\minimal_base64_encoded_image;
 
 class ProfileTest extends TestCase
 {
-    /** @var User */
-    private $user;
-
-    public function setUp(): void
+    #[Test]
+    public function updateProfile(): void
     {
-        parent::setUp();
+        $user = create_user();
 
-        // @phpstan-ignore-next-line
-        $this->user = User::factory()->create(['password' => Hash::make('secret')]);
+        $this->putAs(
+            'api/me',
+            [
+                'name' => 'Foo',
+                'email' => 'bar@baz.com',
+            ],
+            $user,
+        )->assertOk();
+
+        $user->refresh();
+
+        self::assertSame('Foo', $user->name);
+        self::assertSame('bar@baz.com', $user->email);
     }
 
-    public function testUpdateProfileRequiresCurrentPassword(): void
+    #[Test]
+    public function updateProfileWithAvatar(): void
     {
-        $this->putAsUser('api/me', [
-            'name' => 'Foo',
-            'email' => 'bar@baz.com',
-        ], $this->user)
-            ->assertStatus(Response::HTTP_UNPROCESSABLE_ENTITY);
+        $user = create_user();
+        self::assertNull($user->getRawOriginal('avatar'));
+
+        $this->putAs(
+            'api/me',
+            [
+                'name' => 'Foo',
+                'email' => 'bar@baz.com',
+                'avatar' => minimal_base64_encoded_image(),
+            ],
+            $user,
+        )->assertOk();
+
+        $user->refresh();
+
+        self::assertFileExists(image_storage_path($user->getRawOriginal('avatar')));
     }
 
-    public function testUpdateProfileWithoutNewPassword(): void
+    #[Test]
+    public function updateProfileKeepingAvatar(): void
     {
-        $this->putAsUser('api/me', [
-            'name' => 'Foo',
-            'email' => 'bar@baz.com',
-            'current_password' => 'secret',
-        ], $this->user);
+        $user = create_user(['avatar' => 'foo.jpg']);
 
-        $this->user->refresh();
+        $this->putAs(
+            'api/me',
+            [
+                'name' => 'Foo',
+                'email' => 'bar@baz.com',
+            ],
+            $user,
+        )->assertOk();
 
-        self::assertSame('Foo', $this->user->name);
-        self::assertSame('bar@baz.com', $this->user->email);
-        self::assertTrue(Hash::check('secret', $this->user->password));
+        $user->refresh();
+
+        self::assertSame('foo.jpg', $user->getRawOriginal('avatar'));
     }
 
-    public function testUpdateProfileWithNewPassword(): void
+    #[Test]
+    public function updateProfileRemovingAvatar(): void
     {
-        $this->putAsUser('api/me', [
-            'name' => 'Foo',
-            'email' => 'bar@baz.com',
-            'new_password' => 'new-secret',
-            'current_password' => 'secret',
-        ], $this->user)
-            ->assertJsonStructure(['token']);
+        $user = create_user(['avatar' => 'foo.jpg']);
 
-        $this->user->refresh();
+        $this->putAs(
+            'api/me',
+            [
+                'name' => 'Foo',
+                'email' => $user->email,
+                'avatar' => null,
+            ],
+            $user,
+        )->assertOk();
 
-        self::assertSame('Foo', $this->user->name);
-        self::assertSame('bar@baz.com', $this->user->email);
-        self::assertTrue(Hash::check('new-secret', $this->user->password));
+        $user->refresh();
+
+        self::assertNull($user->getRawOriginal('avatar'));
+    }
+
+    /** @return array<string, array<string>> */
+    public static function avatarsThatAreNotImageDataProvider(): array
+    {
+        return [
+            'remote URL' => ['https://example.com/avatar.jpg'],
+            'non-image data URL' => ['data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=='],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('avatarsThatAreNotImageDataProvider')]
+    public function updateProfileRejectsAvatarThatIsNotImageData(string $avatar): void
+    {
+        $user = create_user(['avatar' => 'foo.jpg']);
+
+        $this->putAs(
+            'api/me',
+            [
+                'name' => 'Foo',
+                'email' => $user->email,
+                'avatar' => $avatar,
+            ],
+            $user,
+        )->assertUnprocessable();
+
+        self::assertSame('foo.jpg', $user->refresh()->getRawOriginal('avatar'));
+    }
+
+    #[Test]
+    public function disabledInDemo(): void
+    {
+        config(['koel.misc.demo' => true]);
+        $user = create_user(['name' => 'Original', 'email' => 'original@example.com']);
+
+        $this->putAs(
+            'api/me',
+            [
+                'name' => 'Foo',
+                'email' => 'bar@baz.com',
+            ],
+            $user,
+        )->assertNoContent();
+
+        $user->refresh();
+        self::assertSame('Original', $user->name);
+        self::assertSame('original@example.com', $user->email);
     }
 }
